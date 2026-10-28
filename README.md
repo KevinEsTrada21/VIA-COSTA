@@ -134,16 +134,14 @@ El script ubicado en `src/main/resources/db/schema.sql` crea la base de datos `v
 
 ## 6. Instrucciones de Ejecución
 
-### Opción 1: Mediante el ejecutable directo (Recomendado en Windows)
-Haga doble clic en el archivo:
-```text
-run.bat
-```
+### Opción 1: Directo desde el IDE (Recomendado)
+Abra el archivo [`Main.java`](file:///c:/Users/User/Desktop/Nueva%20carpeta/VIA%20COSTA/src/main/java/com/viacosta/Main.java) (o `MainApp.java`) y presione directamente el botón verde **Play (▶)** junto al método `main`. No requiere configuración adicional de VM ni parámetros.
+
+También puede seleccionar la configuración de ejecución preconfigurada **`Main`** en la barra superior de IntelliJ IDEA y presionar **Play**.
 
 ### Opción 2: Mediante consola con Maven Wrapper
-Abra una terminal (PowerShell o CMD) en la carpeta del proyecto y ejecute:
+Abra una terminal en la carpeta del proyecto y ejecute:
 ```powershell
-$env:JAVA_HOME = "C:\Program Files\Java\jdk-17"
 .\mvnw.cmd clean compile javafx:run
 ```
 

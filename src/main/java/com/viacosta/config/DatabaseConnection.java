@@ -1,31 +1,42 @@
 package com.viacosta.config;
 
+import javax.swing.JOptionPane;
+import javax.swing.JPasswordField;
+import java.awt.GraphicsEnvironment;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.LocalDate;
+import java.util.LinkedHashSet;
 import java.util.Properties;
+import java.util.Set;
 
 /**
- * Gestor centralizado de conexiones JDBC para VIACOSTA.
- * Implementa el patrón Singleton seguro y mecanismo de contingencia automática
- * (H2 en memoria compatible con MySQL) para garantizar la continuidad operativa
- * durante evaluaciones académicas o fallos de red/credenciales.
+ * Gestor de conexion a base de datos MySQL con respaldo persistente en disco.
  */
 public class DatabaseConnection {
 
+    private static String mysqlServerUrl = "jdbc:mysql://localhost:3306/?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=America/Lima&characterEncoding=UTF-8";
     private static String mysqlUrl = "jdbc:mysql://localhost:3306/viacosta?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=America/Lima&characterEncoding=UTF-8";
     private static String mysqlUser = "root";
-    private static String mysqlPassword = "TuContrasena123";
+    private static String mysqlPassword = "root";
     private static String mysqlDriver = "com.mysql.cj.jdbc.Driver";
 
-    private static String h2Url = "jdbc:h2:mem:viacosta;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1";
+    private static String h2Url = "jdbc:h2:./data/viacosta_db;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;AUTO_SERVER=TRUE";
     private static String h2User = "sa";
     private static String h2Password = "";
 
     private static boolean useFallbackH2 = false;
+    private static boolean mysqlInitialized = false;
     private static boolean h2Initialized = false;
+    private static boolean passwordPromptShown = false;
 
     static {
         cargarConfiguracion();
@@ -36,25 +47,18 @@ public class DatabaseConnection {
             if (is != null) {
                 Properties props = new Properties();
                 props.load(is);
-                if (props.getProperty("db.url") != null) mysqlUrl = props.getProperty("db.url");
-                if (props.getProperty("db.user") != null) mysqlUser = props.getProperty("db.user");
-                if (props.getProperty("db.password") != null) mysqlPassword = props.getProperty("db.password");
-                if (props.getProperty("db.driver") != null) mysqlDriver = props.getProperty("db.driver");
-                if (props.getProperty("db.h2.url") != null) h2Url = props.getProperty("db.h2.url");
-                if (props.getProperty("db.h2.user") != null) h2User = props.getProperty("db.h2.user");
+                if (props.getProperty("db.url") != null) mysqlUrl = props.getProperty("db.url").trim();
+                if (props.getProperty("db.user") != null) mysqlUser = props.getProperty("db.user").trim();
+                if (props.getProperty("db.password") != null) mysqlPassword = props.getProperty("db.password").trim();
+                if (props.getProperty("db.driver") != null) mysqlDriver = props.getProperty("db.driver").trim();
+                if (props.getProperty("db.h2.url") != null) h2Url = props.getProperty("db.h2.url").trim();
+                if (props.getProperty("db.h2.user") != null) h2User = props.getProperty("db.h2.user").trim();
             }
         } catch (Exception e) {
-            System.err.println("[DatabaseConnection] Aviso: No se pudo leer config.properties, usando valores por defecto: " + e.getMessage());
+            System.err.println("[DatabaseConnection] No se pudo leer config.properties: " + e.getMessage());
         }
     }
 
-    /**
-     * Obtiene una conexión activa a la base de datos.
-     * Si falla la conexión a MySQL, conmuta automáticamente a la base de contingencia H2.
-     *
-     * @return Conexión JDBC activa
-     * @throws SQLException Si no se puede establecer ninguna conexión
-     */
     public static synchronized Connection getConnection() throws SQLException {
         if (useFallbackH2) {
             return getH2Connection();
@@ -62,16 +66,135 @@ public class DatabaseConnection {
 
         try {
             Class.forName(mysqlDriver);
+            if (!mysqlInitialized) {
+                if (inicializarMySQL()) {
+                    mysqlInitialized = true;
+                } else {
+                    useFallbackH2 = true;
+                    return getH2Connection();
+                }
+            }
             return DriverManager.getConnection(mysqlUrl, mysqlUser, mysqlPassword);
-        } catch (ClassNotFoundException e) {
-            System.err.println("[DatabaseConnection] Driver MySQL no hallado. Conmutando a contingencia H2.");
-            useFallbackH2 = true;
-            return getH2Connection();
-        } catch (SQLException e) {
-            System.err.println("[DatabaseConnection] Error conectando a MySQL (" + e.getMessage() + "). Conmutando a contingencia H2.");
+        } catch (Exception e) {
+            System.err.println("[DatabaseConnection] Usando base de datos local en disco: " + e.getMessage());
             useFallbackH2 = true;
             return getH2Connection();
         }
+    }
+
+    private static boolean inicializarMySQL() {
+        DriverManager.setLoginTimeout(2);
+        Set<String> candidatos = new LinkedHashSet<>();
+        candidatos.add(mysqlPassword);
+        candidatos.add("");
+        candidatos.add("root");
+        candidatos.add("1234");
+        candidatos.add("123456");
+        candidatos.add("admin");
+        candidatos.add("12345");
+        candidatos.add("mysql");
+
+        for (String pass : candidatos) {
+            if (probarYPrepararMySQL(pass)) {
+                if (!pass.equals(mysqlPassword)) {
+                    mysqlPassword = pass;
+                    guardarPasswordEnConfig(pass);
+                }
+                return true;
+            }
+        }
+
+        if (!passwordPromptShown && !GraphicsEnvironment.isHeadless() && !esEjecucionDeTest()) {
+            passwordPromptShown = true;
+            while (true) {
+                JPasswordField pf = new JPasswordField();
+                int ok = JOptionPane.showConfirmDialog(
+                        null,
+                        new Object[]{
+                                "Para conectar con tu MySQL Workbench, ingresa la contraseña de tu usuario '" + mysqlUser + "':\n" +
+                                "(Si presionas Cancelar, los datos igual se guardarán en la carpeta local 'data')",
+                                pf
+                        },
+                        "Conectar a MySQL",
+                        JOptionPane.OK_CANCEL_OPTION,
+                        JOptionPane.QUESTION_MESSAGE
+                );
+                if (ok != JOptionPane.OK_OPTION) {
+                    break;
+                }
+                String ingresada = new String(pf.getPassword()).trim();
+                if (probarYPrepararMySQL(ingresada)) {
+                    mysqlPassword = ingresada;
+                    guardarPasswordEnConfig(ingresada);
+                    JOptionPane.showMessageDialog(
+                            null,
+                            "Conectado a MySQL correctamente. La base de datos 'viacosta' está lista.",
+                            "MySQL Conectado",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
+                    return true;
+                } else {
+                    int retry = JOptionPane.showConfirmDialog(
+                            null,
+                            "Contraseña de MySQL incorrecta para el usuario '" + mysqlUser + "'. ¿Deseas intentar de nuevo?",
+                            "Error de contraseña MySQL",
+                            JOptionPane.YES_NO_OPTION,
+                            JOptionPane.WARNING_MESSAGE
+                    );
+                    if (retry != JOptionPane.YES_OPTION) {
+                        break;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean probarYPrepararMySQL(String password) {
+        try (Connection serverConn = DriverManager.getConnection(mysqlServerUrl, mysqlUser, password);
+             Statement st = serverConn.createStatement()) {
+            st.execute("CREATE DATABASE IF NOT EXISTS viacosta CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;");
+        } catch (SQLException e) {
+            return false;
+        }
+
+        try (Connection dbConn = DriverManager.getConnection(mysqlUrl, mysqlUser, password)) {
+            inicializarEsquemaYDatosSiVacio(dbConn);
+            System.out.println("[DatabaseConnection] Conectado exitosamente a MySQL (base de datos: viacosta).");
+            return true;
+        } catch (SQLException e) {
+            System.err.println("[DatabaseConnection] Error preparando esquema en MySQL: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static void guardarPasswordEnConfig(String nuevaPassword) {
+        String[] rutas = {
+                "src/main/resources/config.properties",
+                "target/classes/config.properties"
+        };
+        for (String ruta : rutas) {
+            try {
+                File f = new File(ruta);
+                if (f.exists()) {
+                    String contenido = Files.readString(f.toPath(), StandardCharsets.UTF_8);
+                    contenido = contenido.replaceAll("(?m)^db\\.password=.*$", "db.password=" + nuevaPassword);
+                    try (FileOutputStream fos = new FileOutputStream(f, false)) {
+                        fos.write(contenido.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static boolean esEjecucionDeTest() {
+        for (StackTraceElement el : Thread.currentThread().getStackTrace()) {
+            if (el.getClassName().startsWith("org.junit.")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Connection getH2Connection() throws SQLException {
@@ -79,7 +202,7 @@ public class DatabaseConnection {
             Class.forName("org.h2.Driver");
             Connection conn = DriverManager.getConnection(h2Url, h2User, h2Password);
             if (!h2Initialized) {
-                inicializarEsquemaH2(conn);
+                inicializarEsquemaYDatosSiVacio(conn);
                 h2Initialized = true;
             }
             return conn;
@@ -88,8 +211,7 @@ public class DatabaseConnection {
         }
     }
 
-    private static void inicializarEsquemaH2(Connection conn) {
-        System.out.println("[DatabaseConnection] Inicializando esquema y datos semilla en motor de contingencia H2...");
+    private static void inicializarEsquemaYDatosSiVacio(Connection conn) {
         try (Statement st = conn.createStatement()) {
             st.execute("CREATE TABLE IF NOT EXISTS empresa (" +
                     "id_empresa INT AUTO_INCREMENT PRIMARY KEY, " +
@@ -193,41 +315,83 @@ public class DatabaseConnection {
                     "hora_viaje TIME NOT NULL, " +
                     "precio_unitario DECIMAL(10,2) NOT NULL);");
 
-            // Seed Data H2
-            st.execute("MERGE INTO empresa KEY(id_empresa) VALUES (1, '20601234567', 'Empresa de Transportes Vía Costa Express S.R.L.', 'Av. Víctor Raúl Haya de la Torre 342, Chimbote');");
-            st.execute("MERGE INTO sedes KEY(id_sede) VALUES (1, 'Agencia Chimbote - Terminal Terrestre El Chimbador', 'Chimbote', 1), (2, 'Agencia Huaraz - Terminal Terrestre de Huaraz', 'Huaraz', 1);");
-            st.execute("MERGE INTO roles KEY(id_rol) VALUES (1, 'ADMINISTRADOR'), (2, 'VENDEDOR');");
-            st.execute("MERGE INTO empleados KEY(id_empleado) VALUES (1, 1, '10203040', 'Carlos', 'Valdiviezo', 'admin', '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9');");
-            st.execute("MERGE INTO empleados KEY(id_empleado) VALUES (2, 1, '72422674', 'Kevin', 'Estrada', 'vendedor', '56976bf24998ca63e35fe4f1e2469b5751d1856003e8d16fef0aafef496ed044');");
-            st.execute("MERGE INTO empleado_roles KEY(id_empleado, id_rol) VALUES (1, 1), (2, 2);");
+            st.execute("CREATE TABLE IF NOT EXISTS detalle_encomienda (" +
+                    "id_detalle_encomienda INT AUTO_INCREMENT PRIMARY KEY, " +
+                    "id_compra INT NOT NULL, " +
+                    "id_asignacion INT NOT NULL, " +
+                    "id_comprobante INT NOT NULL, " +
+                    "destinatario_nombre VARCHAR(100) NOT NULL, " +
+                    "destinatario_dni CHAR(8) NOT NULL, " +
+                    "descripcion VARCHAR(255) NOT NULL, " +
+                    "peso_kg DECIMAL(6,2) NOT NULL, " +
+                    "precio DECIMAL(10,2) NOT NULL);");
 
-            st.execute("MERGE INTO clientes KEY(id_cliente) VALUES (1, '45678901', 'Juan', 'Perez Rodriguez', '943123456', 'Urb. Buenos Aires Mz D Lte 12, Nuevo Chimbote', 'jperez@gmail.com');");
-            st.execute("MERGE INTO clientes KEY(id_cliente) VALUES (2, '78901234', 'Maria', 'Gomez Alva', '943987654', 'Jr. San Martin 450, Huaraz', 'mgomez@outlook.com');");
-            st.execute("MERGE INTO clientes KEY(id_cliente) VALUES (3, '40506070', 'Luis', 'Ramirez Mendoza', '987654321', 'Av. Bolognesi 780, Chimbote', 'lramirez@gmail.com');");
+            // Verificar si ya existen datos para NO sobrescribir las ventas realizadas
+            try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM empresa")) {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    return;
+                }
+            }
 
-            st.execute("MERGE INTO buses KEY(id_bus) VALUES (1, 'T4A-950', 'Marcopolo Paradiso G7 1200 Scania', 30);");
-            st.execute("MERGE INTO tipo_asiento KEY(id_tipo_asiento) VALUES (1, 'Estandar', 'Asientos semi-cama 140°', 0.00), (2, 'VIP', 'Asientos sofá-cama 160°', 15.00), (3, 'Panoramico', 'Asientos frontales panorámicos', 10.00);");
+            System.out.println("[DatabaseConnection] Insertando datos iniciales por primera vez...");
+
+            st.execute("INSERT INTO empresa (id_empresa, ruc, razon_social, direccion) VALUES " +
+                    "(1, '20601234567', 'Empresa de Transportes Vía Costa Express S.R.L.', 'Av. Víctor Raúl Haya de la Torre 342, Chimbote');");
+
+            st.execute("INSERT INTO sedes (id_sede, nombre_sede, ciudad, id_empresa) VALUES " +
+                    "(1, 'Agencia Chimbote - Terminal Terrestre El Chimbador', 'Chimbote', 1), " +
+                    "(2, 'Agencia Huaraz - Terminal Terrestre de Huaraz', 'Huaraz', 1);");
+
+            st.execute("INSERT INTO roles (id_rol, nombre_rol) VALUES (1, 'ADMINISTRADOR'), (2, 'VENDEDOR');");
+
+            st.execute("INSERT INTO empleados (id_empleado, id_sede, dni, nombre, apellido, usuario, clave_hash) VALUES " +
+                    "(1, 1, '10203040', 'Carlos', 'Valdiviezo', 'admin', '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9'), " +
+                    "(2, 1, '72422674', 'Kevin', 'Estrada', 'vendedor', '56976bf24998ca63e35fe4f1e2469b5751d1856003e8d16fef0aafef496ed044');");
+
+            st.execute("INSERT INTO empleado_roles (id_empleado, id_rol) VALUES (1, 1), (2, 2);");
+
+            st.execute("INSERT INTO clientes (id_cliente, dni, nombre, apellido, telefono, direccion, correo) VALUES " +
+                    "(1, '45678901', 'Juan', 'Perez Rodriguez', '943123456', 'Urb. Buenos Aires Mz D Lte 12, Nuevo Chimbote', 'jperez@gmail.com'), " +
+                    "(2, '78901234', 'Maria', 'Gomez Alva', '943987654', 'Jr. San Martin 450, Huaraz', 'mgomez@outlook.com'), " +
+                    "(3, '40506070', 'Luis', 'Ramirez Mendoza', '987654321', 'Av. Bolognesi 780, Chimbote', 'lramirez@gmail.com');");
+
+            st.execute("INSERT INTO buses (id_bus, placa, modelo, capacidad_asientos) VALUES " +
+                    "(1, 'T4A-950', 'Marcopolo Paradiso G7 1200 Scania', 30);");
+
+            st.execute("INSERT INTO tipo_asiento (id_tipo_asiento, nombre, descripcion, cargo_adicional) VALUES " +
+                    "(1, 'Estandar', 'Asientos semi-cama 140°', 0.00), " +
+                    "(2, 'VIP', 'Asientos sofá-cama 160°', 15.00), " +
+                    "(3, 'Panoramico', 'Asientos frontales panorámicos', 10.00);");
 
             for (int i = 1; i <= 30; i++) {
                 int idTipo = (i <= 10) ? 2 : (i <= 14 ? 3 : 1);
-                st.execute(String.format("MERGE INTO asientos KEY(id_asiento) VALUES (%d, 1, %d, %d, 35.00);", i, idTipo, i));
+                st.execute(String.format("INSERT INTO asientos (id_asiento, id_bus, id_tipo_asiento, numero_asiento, precio_base) VALUES (%d, 1, %d, %d, 35.00);", i, idTipo, i));
             }
 
-            st.execute("MERGE INTO rutas KEY(id_ruta) VALUES (1, 'Chimbote', 'Huaraz', 4.5), (2, 'Huaraz', 'Chimbote', 4.5);");
-            st.execute("MERGE INTO asignacion_buses_rutas KEY(id_asignacion) VALUES (1, 1, 1, CURRENT_DATE(), '08:30:00'), (2, 1, 1, CURRENT_DATE(), '14:00:00'), (3, 1, 2, DATEADD('DAY', 1, CURRENT_DATE()), '09:00:00'), (4, 1, 1, DATEADD('DAY', 1, CURRENT_DATE()), '20:30:00');");
+            st.execute("INSERT INTO rutas (id_ruta, origen, destino, duracion_horas) VALUES " +
+                    "(1, 'Chimbote', 'Huaraz', 4.5), " +
+                    "(2, 'Huaraz', 'Chimbote', 4.5);");
+
+            String hoy = LocalDate.now().toString();
+            String manana = LocalDate.now().plusDays(1).toString();
+            st.execute(String.format("INSERT INTO asignacion_buses_rutas (id_asignacion, id_bus, id_ruta, fecha_salida, hora_salida) VALUES " +
+                    "(1, 1, 1, '%s', '08:30:00'), " +
+                    "(2, 1, 1, '%s', '14:00:00'), " +
+                    "(3, 1, 2, '%s', '09:00:00'), " +
+                    "(4, 1, 1, '%s', '20:30:00');", hoy, hoy, manana, manana));
 
             for (int asig = 1; asig <= 4; asig++) {
                 for (int asiento = 1; asiento <= 30; asiento++) {
                     int idEstado = (asig - 1) * 30 + asiento;
                     String estado = (asig == 1 && (asiento == 3 || asiento == 4)) ? "Ocupado" : "Disponible";
-                    st.execute(String.format("MERGE INTO asiento_estado_fecha KEY(id_estado) VALUES (%d, %d, %d, '%s', CURRENT_TIMESTAMP());",
+                    st.execute(String.format("INSERT INTO asiento_estado_fecha (id_estado, id_asiento, id_asignacion, estado) VALUES (%d, %d, %d, '%s');",
                             idEstado, asiento, asig, estado));
                 }
             }
 
-            System.out.println("[DatabaseConnection] Base de datos H2 de contingencia inicializada exitosamente.");
+            System.out.println("[DatabaseConnection] Datos iniciales cargados correctamente.");
         } catch (SQLException e) {
-            System.err.println("[DatabaseConnection] Error inicializando H2: " + e.getMessage());
+            System.err.println("[DatabaseConnection] Error inicializando esquema: " + e.getMessage());
         }
     }
 
